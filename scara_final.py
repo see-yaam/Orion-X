@@ -38,14 +38,14 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-YOLO_MODEL_PATH = Path(r"D:\PycharmProjects\opencv\runs\detect\train\weights\best.pt")
+YOLO_MODEL_PATH = Path("yolov8n.pt")
 CALIBRATION_FILE = Path(__file__).with_name("calibration_matrix.npy")
 
 SERIAL_PORT = "COM5"
 SERIAL_BAUDRATE = 115200
 SERIAL_TIMEOUT_SECONDS = 0.01
 
-CAMERA_INDEX = 2
+CAMERA_INDEX = 0
 CONFIDENCE_THRESHOLD = 0.60
 WINDOW_NAME = "SCARA YOLO11 Locked Snapshot Controller"
 
@@ -287,11 +287,8 @@ def load_homography() -> np.ndarray:
     return matrix
 
 
-def load_model() -> YOLO:
-    if not YOLO_MODEL_PATH.exists():
-        raise FileNotFoundError(f"YOLO model not found: {YOLO_MODEL_PATH}")
-
-    return YOLO(str(YOLO_MODEL_PATH))
+def load_model(weights_path="yolov8n.pt") -> YOLO:
+    return YOLO(weights_path)
 
 
 def open_serial() -> Optional["serial.Serial"]:
@@ -351,10 +348,11 @@ def calculate_inverse_kinematics_mm(x_mm: float, y_mm: float) -> Optional[Tuple[
     return q1_deg, q2_deg
 
 
-def run_yolo_detections(frame: np.ndarray, model: YOLO, homography: np.ndarray) -> List[Detection]:
+def run_yolo_detections(frame: np.ndarray, model: YOLO, homography: np.ndarray, sorting_mode: str = None) -> List[Detection]:
     detections: List[Detection] = []
 
-    results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
+    # Safe PyTorch Inference on CPU with Single Thread to prevent macOS Segfault
+    results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False, device="cpu")
 
     for result in results:
         if result.boxes is None:
@@ -366,16 +364,15 @@ def run_yolo_detections(frame: np.ndarray, model: YOLO, homography: np.ndarray) 
             center_x = (x1 + x2) / 2.0
             center_y = (y1 + y2) / 2.0
 
-            x_mm, y_mm = pixel_to_robot_mm(center_x, center_y, homography)
-
-            ik = calculate_inverse_kinematics_mm(x_mm, y_mm)
-
-            if ik is None:
-                continue
-
             class_id = int(box.cls[0].detach().cpu().item())
             confidence = float(box.conf[0].detach().cpu().item())
             class_name = str(model.names.get(class_id, class_id))
+
+            x_mm, y_mm = pixel_to_robot_mm(center_x, center_y, homography)
+            ik = calculate_inverse_kinematics_mm(x_mm, y_mm)
+
+            j1 = ik[0] if ik is not None else 0.0
+            j2 = ik[1] if ik is not None else 0.0
 
             detections.append(
                 Detection(
@@ -385,8 +382,8 @@ def run_yolo_detections(frame: np.ndarray, model: YOLO, homography: np.ndarray) 
                     center_px=(center_x, center_y),
                     x_mm=x_mm,
                     y_mm=y_mm,
-                    j1_deg=ik[0],
-                    j2_deg=ik[1],
+                    j1_deg=j1,
+                    j2_deg=j2,
                 )
             )
 
@@ -398,10 +395,7 @@ def build_safe_pick_place_sequence(target: Detection, is_first: bool, sorting_mo
     ⚡ DYNAMIC OPTIMIZED SORTING TIMELINE ⚡
     Siam's Logic: Dynamic Drop Zone mappings applied based on 'shape_color' parsing.
     """
-    # অবজেক্টের নাম স্প্লিট করে শেপ এবং কালার ফিল্টার করা (যেমন: 'circle_orange' -> ['circle', 'orange'])
-    parts = target.class_name.lower().split('_')
-    obj_shape = parts[0] if len(parts) > 0 else ""
-    obj_color = parts[1] if len(parts) > 1 else ""
+    obj_class = target.class_name.lower()
 
     # ডিফল্ট ড্রপ কোঅর্ডিনেট সেটআপ
     drop_x = DROP_X_MM
@@ -409,18 +403,16 @@ def build_safe_pick_place_sequence(target: Detection, is_first: bool, sorting_mo
 
     # 🎯 ১. কালার শর্টিং ম্যাপিং লজিক
     if sorting_mode == "COLOUR":
-        if "orange" in obj_color:
+        if "red" in obj_class or "orange" in obj_class or "apple" in obj_class: # warm colors
             drop_x, drop_y = -200.0, 400.0
-        elif "blue" in obj_color:
+        elif "blue" in obj_class or "green" in obj_class or "cup" in obj_class: # cool colors
             drop_x, drop_y = -200.0, 170.0
 
     # 🎯 ২. শেপ শর্টিং ম্যাপিং লজিক
     elif sorting_mode == "SHAPE":
-        if "circle" in obj_shape:
+        if "circle" in obj_class or "triangle" in obj_class or "apple" in obj_class:
             drop_x, drop_y = -200.0, 280.0
-        elif "square" in obj_shape:
-            drop_x, drop_y = -200.0, 400.0
-        elif "rect" in obj_shape:  # 'rectangular' এবং 'rectanguler' দুইটাই হ্যান্ডেল করবে
+        elif "square" in obj_class or "rectangle" in obj_class or "cell phone" in obj_class:
             drop_x, drop_y = -200.0, 170.0
 
     # টার্গেট ড্রপ জোনের আইকে (IK) হিসাব
